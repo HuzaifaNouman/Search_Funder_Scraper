@@ -2,30 +2,14 @@ require('dotenv').config();
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const { Parser } = require('json2csv');
-const path = require('path');
 
 /**
  * SearchFunder Scraper
  * This script logs into searchfunder.com and scrapes user data from the directory
  * based on provided search parameters.
- * Now with checkpoint functionality to resume from the last scraped profile.
  */
-
-// Checkpoint file path
-const CHECKPOINT_FILE = 'scraper_checkpoint.json';
-
 async function scrapeSearchFunder(directoryUrl) {
     console.log('Starting scraper...');
-
-    // Load checkpoint if exists
-    let checkpoint = loadCheckpoint();
-    let lastProfileIndex = checkpoint.lastProfileIndex || -1;
-    let csvFilename = checkpoint.csvFilename || null;
-    let processedProfileIds = new Set(checkpoint.processedProfileIds || []);
-
-    if (csvFilename) {
-        console.log(`Resuming from checkpoint: Last profile index ${lastProfileIndex}, CSV file: ${csvFilename}`);
-    }
 
     // Launch browser with stealth mode to avoid detection
     const browser = await puppeteer.launch({
@@ -33,9 +17,6 @@ async function scrapeSearchFunder(directoryUrl) {
         defaultViewport: null,
         args: ['--start-maximized']
     });
-
-    // Set up graceful shutdown handler for Ctrl+C
-    setupGracefulShutdown(lastProfileIndex, csvFilename, processedProfileIds);
 
     try {
         const page = await browser.newPage();
@@ -110,34 +91,15 @@ async function scrapeSearchFunder(directoryUrl) {
         // Begin incremental scroll, scrape, and save
         console.log('Beginning incremental scroll, scrape, and save...');
 
-        // Create CSV file with headers or use existing file
-        if (!csvFilename) {
-            csvFilename = createCsvWithHeaders();
-            updateCheckpoint(lastProfileIndex, csvFilename, Array.from(processedProfileIds));
-        } else {
-            console.log(`Using existing CSV file: ${csvFilename}`);
-            // Check if file exists
-            if (!fs.existsSync(csvFilename)) {
-                console.log(`CSV file ${csvFilename} not found. Creating a new one.`);
-                csvFilename = createCsvWithHeaders();
-                updateCheckpoint(lastProfileIndex, csvFilename, Array.from(processedProfileIds));
-            }
-        }
+        // Create CSV file with headers first
+        const csvFilename = createCsvWithHeaders();
 
         // Perform the incremental scraping
-        const totalProfilesCount = await scrollScrapeAndSave(page, csvFilename, lastProfileIndex, processedProfileIds);
+        const totalProfilesCount = await scrollScrapeAndSave(page, csvFilename);
 
         console.log(`Scraping completed successfully! Total profiles scraped: ${totalProfilesCount}`);
-        
-        // Clear checkpoint file after successful completion
-        if (fs.existsSync(CHECKPOINT_FILE)) {
-            fs.unlinkSync(CHECKPOINT_FILE);
-            console.log('Checkpoint file cleared after successful completion');
-        }
     } catch (error) {
         console.error('An error occurred:', error);
-        // Save checkpoint on error
-        updateCheckpoint(lastProfileIndex, csvFilename, Array.from(processedProfileIds));
     } finally {
         await browser.close();
     }
@@ -147,7 +109,7 @@ async function scrapeSearchFunder(directoryUrl) {
  * Creates a CSV file with headers
  */
 function createCsvWithHeaders() {
-    const fields = ['name', 'linkedIn_url', 'website_url', 'occupation', 'location', 'uni_name'];
+    const fields = ['name', 'occupation', 'location', 'uni_name', 'linkedIn_url', 'website_url'];
     const parser = new Parser({ fields });
     const csv = parser.parse([]);  // Empty array to just get headers
 
@@ -167,7 +129,7 @@ function appendToCsv(filename, data) {
     if (!data || data.length === 0) return;
 
     try {
-        const fields = ['name', 'linkedIn_url', 'website_url', 'occupation', 'location', 'uni_name'];
+        const fields = ['name', 'occupation', 'location', 'uni_name', 'linkedIn_url', 'website_url'];
         const parser = new Parser({ fields, header: false, nullValue: '' }); // No headers for append, empty string for null values
         const csv = parser.parse(data);
 
@@ -180,123 +142,56 @@ function appendToCsv(filename, data) {
 
 /**
  * Scrolls through the directory page, scrapes profiles, and saves incrementally
- * This preserves the original scrolling logic while adding checkpoint functionality
  */
-async function scrollScrapeAndSave(page, csvFilename, lastProfileIndex, processedProfileIds) {
+async function scrollScrapeAndSave(page, csvFilename) {
     // Using the original selector for profile cards
     const profileSelector = '#directory-results > div > div';
+    let processedProfileIndices = new Set(); // Keep track of already processed profiles
 
     let previousHeight;
     let scrollCount = 0;
     let noChangeCount = 0;
     const maxNoChangeCount = 5; // Stop if content doesn't change after 5 attempts
 
-    console.log(`Starting incremental scroll, scrape, and save (resuming from profile index ${lastProfileIndex + 1})...`);
-    console.log(`${processedProfileIds.size} profiles already processed from previous runs`);
-
-    // If we're resuming, we need to scroll to load approximately the number of profiles we've already processed
-    if (lastProfileIndex > 0) {
-        console.log(`Scrolling to approximate position to load previously processed profiles...`);
-        let currentProfiles = [];
-        let scrollsNeeded = Math.ceil(lastProfileIndex / 10); // Rough estimate of scrolls needed
-        
-        for (let i = 0; i < scrollsNeeded && i < 30; i++) { // Max 30 scrolls to avoid infinite loop
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
-            
-            currentProfiles = await page.evaluate((selector) => {
-                return Array.from(document.querySelectorAll(selector)).length;
-            }, profileSelector);
-            
-            console.log(`Scroll ${i+1}/${scrollsNeeded}: ${currentProfiles} profiles loaded`);
-            
-            // If we've loaded enough profiles, stop scrolling
-            if (currentProfiles > lastProfileIndex) {
-                break;
-            }
-        }
-        console.log(`Finished loading previously processed profiles. Ready to resume scraping.`);
-    }
+    console.log('Starting incremental scroll, scrape, and save...');
 
     // Scroll, scrape, and save until no new content loads
     while (noChangeCount < maxNoChangeCount) {
-        // Get current profile elements with their unique IDs
-        const currentProfilesWithIds = await page.evaluate((selector) => {
+        // Get current profile elements
+        const currentProfiles = await page.evaluate((selector) => {
             const elements = Array.from(document.querySelectorAll(selector));
-            return elements.map((el, index) => {
-                // Create unique identifier for each profile
-                const nameEl = el.querySelector('div > div > span[data-profilecard]');
-                const name = nameEl ? nameEl.textContent.trim() : '';
-                
-                const occupationEl = el.querySelector('div > div:nth-child(3)');
-                const occupation = occupationEl ? occupationEl.textContent.trim() : '';
-                
-                const linkedInEl = el.querySelector('div:nth-child(2) > a[href*="linkedin.com"]');
-                const linkedIn = linkedInEl ? linkedInEl.href : '';
-                
-                // Create a unique ID using available data
-                const uniqueId = `${name}|${occupation}|${linkedIn}`.replace(/\s+/g, '');
-                return { index, uniqueId };
-            });
+            return elements.map((_, index) => index);
         }, profileSelector);
 
         // Find new profiles that haven't been processed yet
-        const newProfiles = currentProfilesWithIds.filter(profile => 
-            profile.index > lastProfileIndex && 
-            !processedProfileIds.has(profile.uniqueId)
-        );
+        const newProfiles = currentProfiles.filter(index => !processedProfileIndices.has(index));
 
         console.log(`Found ${newProfiles.length} new profiles to scrape in this batch`);
 
         // Extract data from new profiles
         if (newProfiles.length > 0) {
-            const batchData = await extractProfileBatch(newProfiles.map(p => p.index), page, profileSelector);
-            
-            // Add uniqueIds to the extracted data
-            for (let i = 0; i < batchData.length; i++) {
-                if (batchData[i] && newProfiles[i]) {
-                    batchData[i].uniqueId = newProfiles[i].uniqueId;
-                }
-            }
+            const batchData = await extractProfileBatch(newProfiles, page, profileSelector);
 
-            // Filter out any profiles we might have already processed (using uniqueId check)
-            const uniqueBatchData = batchData.filter(profile => 
-                profile && profile.uniqueId && !processedProfileIds.has(profile.uniqueId)
-            );
+            // Immediately save this batch to CSV
+            appendToCsv(csvFilename, batchData);
 
-            if (uniqueBatchData.length > 0) {
-                // Clean data before saving (remove uniqueId field which is just for tracking)
-                const cleanBatchData = uniqueBatchData.map(({ uniqueId, ...rest }) => rest);
-                
-                // Immediately save this batch to CSV
-                appendToCsv(csvFilename, cleanBatchData);
-                
-                // Mark these profiles as processed
-                uniqueBatchData.forEach(profile => {
-                    processedProfileIds.add(profile.uniqueId);
-                });
-                
-                // Update the last processed index
-                if (newProfiles.length > 0) {
-                    lastProfileIndex = Math.max(lastProfileIndex, ...newProfiles.map(p => p.index));
-                    // Update checkpoint after each batch
-                    updateCheckpoint(lastProfileIndex, csvFilename, Array.from(processedProfileIds));
-                }
-            }
+            // Mark these profiles as processed
+            newProfiles.forEach(index => processedProfileIndices.add(index));
 
-            console.log(`Total profiles collected so far: ${processedProfileIds.size}`);
+            console.log(`Total profiles collected so far: ${processedProfileIndices.size}`);
         }
 
         // Get current scroll height
         previousHeight = await page.evaluate('document.body.scrollHeight');
 
-        // Scroll to load more content - USING ORIGINAL SCROLLING LOGIC
+        // Scroll to load more content
         await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
 
         // Wait for potential new content to load
         await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 2000)));
 
         scrollCount++;
-        console.log(`Scroll #${scrollCount}, Last profile index: ${lastProfileIndex}, Total profiles: ${processedProfileIds.size}`);
+        console.log(`Scroll #${scrollCount}, Total profiles processed: ${processedProfileIndices.size}`);
 
         // Check if height changed
         const newHeight = await page.evaluate('document.body.scrollHeight');
@@ -311,7 +206,7 @@ async function scrollScrapeAndSave(page, csvFilename, lastProfileIndex, processe
         await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1000 + Math.floor(Math.random() * 500))));
     }
 
-    return processedProfileIds.size;
+    return processedProfileIndices.size;
 }
 
 /**
@@ -376,11 +271,11 @@ async function extractProfileBatch(profileIndices, page, profileSelector) {
 
                 return {
                     name: name || null,
-                    linkedIn_url: linkedIn_url || null,
-                    website_url: website_url || null,
                     occupation: occupation || null,
                     location: location || null,
-                    uni_name: uni_name || null
+                    uni_name: uni_name || null,
+                    linkedIn_url: linkedIn_url || null,
+                    website_url: website_url || null
                 };
             }, profileSelector, index);
 
@@ -390,11 +285,11 @@ async function extractProfileBatch(profileIndices, page, profileSelector) {
                 console.error(`Could not extract data from profile at index ${index}`);
                 batchData.push({
                     name: `Error_Profile_${index}`,
-                    linkedIn_url: null,
-                    website_url: null,
                     occupation: null,
                     location: null,
-                    uni_name: null
+                    uni_name: null,
+                    linkedIn_url: null,
+                    website_url: null
                 });
             }
 
@@ -406,74 +301,16 @@ async function extractProfileBatch(profileIndices, page, profileSelector) {
             console.error(`Error extracting data from profile at index ${index}:`, error);
             batchData.push({
                 name: `Error_Profile_${index}`,
-                linkedIn_url: null,
-                website_url: null,
                 occupation: null,
                 location: null,
-                uni_name: null
+                uni_name: null,
+                linkedIn_url: null,
+                website_url: null
             });
         }
     }
 
     return batchData;
-}
-
-/**
- * Load checkpoint data from file
- */
-function loadCheckpoint() {
-    if (fs.existsSync(CHECKPOINT_FILE)) {
-        try {
-            const data = fs.readFileSync(CHECKPOINT_FILE, 'utf8');
-            const checkpoint = JSON.parse(data);
-            return checkpoint;
-        } catch (error) {
-            console.error('Error loading checkpoint:', error);
-            return { lastProfileIndex: -1, csvFilename: null, processedProfileIds: [] };
-        }
-    }
-    return { lastProfileIndex: -1, csvFilename: null, processedProfileIds: [] };
-}
-
-/**
- * Update checkpoint file with current progress
- */
-function updateCheckpoint(lastProfileIndex, csvFilename, processedProfileIds) {
-    try {
-        const checkpoint = {
-            lastProfileIndex,
-            csvFilename,
-            processedProfileIds: processedProfileIds.length > 1000 
-                ? processedProfileIds.slice(-1000) // Keep only the last 1000 IDs to prevent file from growing too large
-                : processedProfileIds
-        };
-        fs.writeFileSync(CHECKPOINT_FILE, JSON.stringify(checkpoint, null, 2));
-        console.log(`Checkpoint updated: Last profile index ${lastProfileIndex}, ${processedProfileIds.length} processed profiles`);
-    } catch (error) {
-        console.error('Error updating checkpoint:', error);
-    }
-}
-
-/**
- * Setup graceful shutdown handler for Ctrl+C
- */
-function setupGracefulShutdown(lastProfileIndex, csvFilename, processedProfileIds) {
-    let shuttingDown = false;
-
-    process.on('SIGINT', async () => {
-        if (shuttingDown) return;
-        shuttingDown = true;
-        
-        console.log('\n\nGraceful shutdown initiated (Ctrl+C detected).');
-        console.log('Saving checkpoint before exit...');
-        
-        updateCheckpoint(lastProfileIndex, csvFilename, Array.from(processedProfileIds));
-        
-        console.log('Checkpoint saved. You can resume scraping with the same command.');
-        console.log('Exiting...');
-        
-        process.exit(0);
-    });
 }
 
 /**
